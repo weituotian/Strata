@@ -669,6 +669,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             return false;
         }
     }
+    strata::core::progress_note("token: launching the layer graphs");
     {
         const auto t0 = std::chrono::steady_clock::now();
         const cudaError_t le = cudaGraphLaunch(gr.execs[0], cs);
@@ -795,6 +796,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // exists to show what the pipeline is worth, and hiding its cost here would defeat the comparison.
         gr.ms_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ring).count();
     }
+    strata::core::progress_note("token: final sync");
     if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "session_loop: final sync"; return false; }
     return true;
 }
@@ -867,6 +869,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
     }
     cudaStream_t cs = nullptr;
     if (cudaStreamCreate(&cs) != cudaSuccess) { err = "session_capture_token: stream create failed"; return false; }
+    strata::core::progress_note("session capture token: begin capture", g.n_layers);
     if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         cudaStreamDestroy(cs);
         err = "session_capture_token: begin capture failed";
@@ -875,6 +878,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
     int64_t qsa_index = 0;
     bool ok = true;
     for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+        strata::core::progress_note("session capture token: layer", l);
         gdn_point_at(g, l, s);
         const bool qsa = is_qsa_layer(g, l);
         QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];

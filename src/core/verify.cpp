@@ -417,8 +417,14 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
 }
 
 void Verifier::trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const {
-    if (!g_trace) return;
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
+    // The crash-proof channel: the same handshake event, straight to the fsync'd trace file, so a hard reset keeps
+    // the last thing this window did (STRATA_TRACE_FILE; no ring, no STRATA_VERIFY_TRACE needed).  a=step/argument,
+    // b=layer, c=aux, d=the GPU's ring counter (seq), e=flag A, f=flag B.
+    if (strata::core::progress_trace_file() != nullptr)
+        strata::core::progress_trace_line("EV", what, step, layer, aux, (int64_t) rd(h_seq_), (int64_t) rd(h_flagA_),
+                                          (int64_t) rd(h_flagB_));
+    if (!g_trace) return;
     TraceEv& e = g_trace_ring[g_trace_next.fetch_add(1) % kTraceN];
     e = {trace_now_ns(), this, windows, step, layer, aux, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), what};
 }
@@ -1888,13 +1894,16 @@ bool Verifier::capture(int T, std::string& err) {
         else
             (void) cudaGetLastError();
     }
+    strata::core::progress_note("verify: begin capture", T);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
+    strata::core::progress_note("verify: record window", T);
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
+    strata::core::progress_note("verify: end capture", T);
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
@@ -2002,9 +2011,11 @@ bool Verifier::capture(int T, std::string& err) {
 #endif
     }
 #endif
+    strata::core::progress_note("verify: instantiate", T);
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
+    strata::core::progress_note("verify: upload + sync", T);
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,

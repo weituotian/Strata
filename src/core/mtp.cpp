@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/progress.hpp"   // STRATA_TRACE_FILE: the prefill steps are on disk before they run
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
@@ -1247,6 +1248,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
+    strata::core::progress_note("mtp prefill: begin capture", T);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
@@ -1257,6 +1259,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
+    strata::core::progress_note("mtp prefill dev: begin capture", T);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
@@ -1623,6 +1626,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (dt) g_dt.pre_ms += hms(t0);
         if (dt) cudaEventRecord(g_dt.eb[0], cs_);
         Clock::time_point tl = Clock::now();
+        strata::core::progress_note("mtp: draft round launch", T);   // ours: the line before the launch that may never return
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1633,6 +1637,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(tokens[a]);
         progress_at("mtp draft: waiting for the GPU");   // #2065: a stall here read as "decode", the verify window before it
         auto wait_step = [&](int j) {
+            strata::core::progress_note("mtp: draft wait step", (int64_t) j);   // the host spins here until the GPU posts
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
@@ -1669,6 +1674,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         }
         prefetch_ple(drafts[n - 1]);
         const Clock::time_point t_pre_sync = Clock::now();
+        strata::core::progress_note("mtp: draft sync", T);           // ours: the sync below is what a death here would be waiting on
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;

@@ -1801,6 +1801,11 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // STRATA_TRACE_FILE: create the trace file now (a HEAD line) and start its heartbeat thread, so the file itself
+    // shows the engine is running and recording long before the first request - and an empty file then means "never
+    // reached main".  STRATA_TRACE_HEARTBEAT_S sets the interval (default 5 s; 0 = off).
+    strata::core::progress_trace_begin("engine");
+    strata::core::progress_at("loading: starting up", (int64_t) argc);
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
@@ -4434,6 +4439,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
                 return 1;
             }
+            strata::core::progress_at("loading: the PLE table", (int64_t) ple_table.rows());
             std::fprintf(stderr, "strata generate: PLE on, table %llu rows of %s\n",
                          (unsigned long long) ple_table.rows(), o.ple_gguf.c_str());
         }
@@ -5010,7 +5016,10 @@ int main(int argc, char** argv) {
         }
         if (!arena_src.ram_warning().empty())   // #633: said before the load's numbers, which it explains
             std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
+        strata::core::progress_at("loading: the expert arena (reading the weights)", 0);
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        strata::core::progress_at("loading: experts loaded (startup done)",
+                                  (int64_t) (strata::kernels::cpu::expert_layout().total / (1024 * 1024)));
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -5224,6 +5233,20 @@ int main(int argc, char** argv) {
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
                          reserve_tip.c_str());
+#if defined(_WIN32)
+            // #243, and the card that made this line ambiguous: the advice above costs the context or the cache when
+            // the real cause is the arena's own mapped pin.  `cudaHostRegister` with cudaHostRegisterMapped is
+            // charged to the GPU's shared (non-local) WDDM segment, and a pin that ran until the driver refused a
+            // slice leaves that segment full - so this line reads ~0 free on a 24 GB card that has 16.9 GiB of its
+            // own VRAM free (nvidia-smi agrees with the 16.9), and the first small cudaMalloc after it fails with
+            // "the embedding buffer failed".  Measured 2026-10-11: 46.7 GB of shared segment in use, the same
+            // config with the pin capped (38 GiB pinned, 4 GiB of the budget held back) runs with 17.3 GiB free.
+            // The knobs above cannot help there; this one can, so it is named where the others are.
+            std::fprintf(stderr, "strata generate: if nvidia-smi shows this card mostly free, the arena's mapped pin "
+                                 "is what filled the GPU's shared-memory segment (issue #243): "
+                                 "STRATA_ARENA_PIN_GIB=auto caps it below that budget instead of at the driver's "
+                                 "first refusal\n");
+#endif
         }
     } else if (multi_gpu && o.expert_cache > 0) {
         // an explicit cache size leaves room for the prompt path's buffers and the reserve, or the first prompt
@@ -5427,6 +5450,7 @@ int main(int argc, char** argv) {
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     if (o.expert_cache > 0) {
+        strata::core::progress_at("loading: filling the GPU expert cache", (int64_t) xcache.slots());
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
@@ -6007,6 +6031,7 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
+    strata::core::progress_at("idle", 0);   // ready: from here the heartbeat says "idle" until a request arrives
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
@@ -6016,7 +6041,17 @@ int main(int argc, char** argv) {
     };
     float* d_emb = nullptr;
     if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
+        // #620 #486: the note every other allocation in this file carries.  This buffer is `n_embd * 4` bytes (a few
+        // KB), so a failure here is never its own size: the card is full, and the figure that says how full is the
+        // "expert cache auto ... -> 0 slots" line and the reserve note above.  Said as "the embedding buffer failed"
+        // alone, it reads as a defect in the embedding path and hides an out-of-VRAM start (a 24 GB card whose other
+        // ~17 GiB were held failed exactly so).  The error code is read first: `vram_free_note` clears the last error.
+        const cudaError_t ce = cudaGetLastError();
+        std::fprintf(stderr, "strata generate: the embedding buffer (%lld floats) failed: %s%s. The card was full "
+                             "before this allocation - the lines above say how much was short (an expert cache of 0 "
+                             "slots leaves nothing for the session's own buffers); nvidia-smi / rocm-smi lists what "
+                             "else holds it\n", (long long) g.n_embd, cudaGetErrorString(ce),
+                     vram_free_note().c_str());
         return 1;
     }
     // **`sample_tokens` TAKES DEVICE POINTERS.**  It is a kernel launch; `logits` and `out` are both read and
@@ -6025,7 +6060,10 @@ int main(int argc, char** argv) {
     // illegal access on a weight plane.  Nothing in the parameter names said device.
     int* d_next = nullptr;
     if (cudaMalloc(&d_next, sizeof(int)) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: the sampler output buffer failed\n");
+        const cudaError_t ce = cudaGetLastError();   // read before `vram_free_note` clears it
+        std::fprintf(stderr, "strata generate: the sampler output buffer (%llu bytes) failed: %s%s\nThe card was full "
+                             "before this allocation (see the expert cache and reserve lines above)\n",
+                     (unsigned long long) sizeof(int), cudaGetErrorString(ce), vram_free_note().c_str());
         return 1;
     }
 
@@ -9501,6 +9539,7 @@ int main(int argc, char** argv) {
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
+            strata::core::progress_trace_line("NOTE", what, a, b, -1);   // STRATA_TRACE_FILE: the step is on disk first
             if (!trace) return;
             std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
             std::fflush(stderr);
