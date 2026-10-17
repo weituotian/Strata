@@ -106,23 +106,71 @@ set STRATA_BUILD_TESTS=OFF
 ## 6. 起 / 停服务
 
 ```
-起：双击 D:\strata-blackbox\start_trace_run.cmd      # 默认档 + 掉电留痕；会先删旧的 trace 文件
-停：杀 serve.server 的 python 进程 + strata.exe
+日常（双卡 3090+V100，不插桩、零开销）：
+  起：双击 d:\projects\ai\Strata\start-2gpu.cmd        # 会先清场，就绪后自动开浏览器
+  停：双击 d:\projects\ai\Strata\stop-2gpu.cmd         # 或直接关那个窗口
+
+排障（带插桩，代价是每行 fsync；实测比不插桩慢 30-40%）：
+  双卡：D:\strata-blackbox\start_trace_2gpu.cmd
+  3090 单卡：start_trace_run.cmd ／ V100 单卡：start_trace_v100.cmd
+  ⚠ 带插桩的脚本会先删旧 trace 文件 —— 掉电后**先备份现场**再重启。
 ```
 
 ## 7. 更新上游源码同时保留插桩
 
-```powershell
-cd d:\projects\ai\Strata
-git diff > D:\strata-blackbox\our-instrumentation.patch     # 1) 先备份插桩
-git stash push -m "our instrumentation"                     # 2) 收起来
-git -c http.proxy=http://127.0.0.1:10800 fetch --all --tags # 3) 代理已配在 git config，直接 fetch 也行
-git merge --no-edit origin/main                             # 4) 合并
-git stash pop                                               # 5) 贴回（有冲突就手工合）
+本仓库是 **`Niko1221/Strata` 的正规 clone**（`origin` = 上游，`weituotian` = 你自己的 fork）。
+本地对源码的改动只有 **5 个文件（+230/−3）**，另有 `tools/strata_bench.py`（+2/−1，中文 Windows 的编码修复）。
+
+### 7.1 分支约定（2026-10-17 建立）
+
+| 分支 | 内容 | 规则 |
+|---|---|---|
+| `main` | 上游 + 你自己的 1 个修复（`65120a03` vision stdin）+ 2 个 merge 提交 | 只用来对齐上游，**不放插桩** |
+| **`local/instrument`** | 插桩 + bench 编码修复 + 文档 / 启动脚本 / bench 报告 | **平时就在这个分支上编译、跑服务** |
+
+```cmd
+git checkout local/instrument      :: 回到带插桩的分支（平时用这个）
+git checkout main                  :: 只看上游（没有插桩，别在这编译）
 ```
 
-实测记录（2026-10-13）：合并了 105 个提交到 `0.1.43.1` 那条线，插桩**零冲突**贴回。
-贴回后务必再跑一次编译（见 §5），并检查 `git diff --stat` 仍是 5 个文件。
+### 7.2 更新流程（推荐）
+
+```cmd
+cd d:\projects\ai\Strata
+git -c http.proxy=http://127.0.0.1:10800 fetch origin   :: 网络需要代理时这样写（不改全局 config）
+git checkout main
+git merge --no-edit origin/main                          :: main 上有本地那个 vision 修复，所以不能用 --ff-only
+git checkout local/instrument
+git rebase main                                          :: 把插桩重放到新上游上
+```
+
+- **冲突只会出现在那 5 个文件**，绝大多数落在 `src/program/generate.cpp`（上游改得最勤）；
+  插桩的 167 行主体在 `include/strata/core/progress.hpp`（新增代码，几乎不冲突）。
+- 想让插桩整体以补丁为准：
+  ```cmd
+  git checkout --ours src/program/generate.cpp        :: 先取上游版本
+  git apply --3way D:\strata-blackbox\our-instrumentation-20261017.patch
+  ```
+- **更新后必须**：重编（§5.1 `build_v100_cuda12.cmd` → 拷到 `engine\`）→ 起服务看 `session is up` → 发一条短请求。
+- 校验：`git diff --stat main..local/instrument -- include/ src/ tools/` 仍应只有那 6 个文件。
+
+### 7.3 补丁兜底（不依赖 git 也能救）
+
+```cmd
+git diff main..local/instrument -- include/strata/core/progress.hpp src/ tools/strata_bench.py > D:\strata-blackbox\our-instrumentation-<日期>.patch
+```
+
+- 现有：`our-instrumentation-20261017.patch`（25.1 KB，6 个文件）
+- **真正的价值**：`git apply` 不要求目标目录是 git 仓库 —— 哪天直接用 zip 下的新版源码，把补丁打上去就能编出带插桩的引擎。
+
+### 7.4 更彻底的解法（按收益排序）
+
+1. **推给上游**：插桩是通用的（环境变量驱动、关掉零成本、不改变输出），`weituotian/Strata` 是你的 fork，开 PR 到 `Niko1221/Strata`；合并后这 230 行永久不用再管。
+2. **继续收窄冲突面**：逻辑往 `progress.hpp` 里塞，`generate.cpp` 只留"解析参数 + 调一个函数"。
+3. 老的 `git stash` 流程仍可用，但分支法更稳（rebase 中途出问题时 stash 容易丢东西）。
+
+> 历史记录：2026-10-13 用 stash 法合并了 105 个提交到 `0.1.43.1` 线，插桩零冲突贴回。
+> 2026-10-17 起改为上面的分支法；当日上游领先 **264 个提交**、最新 tag **v0.1.45**（本地是 0.1.44.1）。
 
 ## 8. 注意事项
 
