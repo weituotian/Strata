@@ -311,6 +311,35 @@ models\IQ3_S\ =  51.05 GB + 26.82 GB  GGUF 分片
 **回滚**：`engine\strata.exe` 已还原为验证过的旧版；新构建只在 `build-cuda12\`（`build_arena_check.cmd` 只编不装），
 旧引擎备份在 `D:\strata-blackbox\engine-arena-skip\`。
 
+### 4.9 ✅ 实装完成并实测（2026-10-19 22:2x）
+
+打通 GGUF 路线后（`load_experts_gguf` 加了 `dst_bias` **和层范围 `l0/l1`** —— 它原来遍历全部 48 层），实测：
+
+```
+strata generate: arena-skip: layers 27-47 are fully resident: 21.71 GiB of the expert arena handed back to the OS
+```
+
+| 指标 | 改前 | 改后 |
+|---|---:|---:|
+| 起服务后 **commit 余量** | **0.4 GiB**（已到 0xC0000409 边缘） | **21.1 GiB** |
+| 进程占用 commit | ~64.5 GiB | **~43.4 GiB** |
+| 真实流量回放 decode | 106.2 | **106.7**（配对中位 −1.2%，5 正 5 负 = 噪声） |
+| `could not produce a blob` | — | **0 次**（"永不读"成立） |
+| 分段占比 | 96.65/0.20/3.10 | 96.30/0.20/3.50（槽位波动） |
+
+**开关**：`STRATA_ARENA_RELEASE_BLOCK=1`（默认关；**关闭时仍是单块 46.8 GiB，逐位不变**）。
+已写入日常启动脚本 `start-2gpu.cmd`。
+
+**踩到的两个坑（都已修）**：
+1. `lay.bytes[l]` 是**每个专家**的字节数，不是每层 —— 求和要乘 `lay.n_expert`（否则报
+   `the load read 98227200 B of 50292326400`）；
+2. 用脚本批量替换 `for (int64_t l = 0; l < lay.n_layers; ++l)` 时**误伤了 `open_gguf`**（同文件另一函数），
+   编译报 `l0/l1 未定义` —— 教训：这类替换要带足够上下文，不要只匹配循环头。
+
+**待确认（不影响采用）**：回放里首 token 配对中位 **+27%（8 升 2 降）**，但那是 **#56 的 204K 冷读** ——
+本次启动刚用 unbuffered 读了 50 GB，文件缓存是冷的；decode 不变说明解码路径没受影响。
+要用热缓存复核，把同一 suite 再跑一次即可（4.4 分钟）。
+
 > **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
 > **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
 
