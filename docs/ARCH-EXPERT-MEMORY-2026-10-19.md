@@ -275,6 +275,42 @@ std::memcpy(dst + off + pos, buf.data(), (size_t) n);
 
 **分三次提交，每次都能单独编译**：① pinned（3 文件）→ ② expert_source 双块 → ③ generate.cpp 判定与释放。
 
+### 4.8 实装进度与真正卡住的地方（2026-10-19 晚）
+
+| 提交 | 内容 | 状态 |
+|---|---|---|
+| `51538d55` | `load_experts_ranges` 的 `dst_bias` | ✅ 编译通过 |
+| `5f1ad550` | `ArenaExpertSource` 第二块骨架（成员 / `set_split_layer` / `release_tail`） | ✅ 惰性 |
+| `1a957d55` | 双块装载 + `blob_at()` 分流 + `host_res` 之后的释放判定 | ✅ 编译通过 |
+
+**实测：机制没触发**（日志无 `arena-skip:`）。根因不是代码 bug，而是**数据来源**：
+
+```
+packs\iq3_s\  =  tokenizer / dense.bin / index.txt / native_experts.txt      ← 没有 experts.bin
+models\IQ3_S\ =  51.05 GB + 26.82 GB  GGUF 分片
+```
+
+⇒ 本机走 **`from_gguf`**（`native_experts.txt`），专家由 **`load_experts_gguf()`** 从 GGUF 分片读，
+不是 `load_experts_ranges()` 从 `experts.bin` 读。而我在 `tail_ok` 里排除了 `from_gguf`，所以尾部块根本没建。
+
+（顺带纠正一处旧观察：日志里的 `51.1 GiB of files` 是**第一个 GGUF 分片**的大小，不是 experts.bin。）
+
+**打通本机的最后一处**：`load_experts_gguf()` 需要**两个**新参数 —— 不只是 `dst_bias`：
+
+- `dst_bias`：它的目标地址由一个 lambda 给出（`expert_source.cpp:4305-4307`）
+  `pad ? pad->blob_off(l,e) : lay.blob_offset(l,e)` ⇒ 减 `dst_bias` 即可；
+- **层范围 `l0/l1`**：它按 `lay.n_layers` **遍历全部 48 层**（`atomic<int64_t> next{0}` + `l >= lay.n_layers`），
+  不像 ranges 版接收 `loff/lbytes` 子集。**不加层范围就会把 48 层都写进第二块**（越界）。
+
+改完后：`tail_ok` 去掉 `!from_gguf`，两块的调用分别传 `[0,K)` / `[K,48)` 与 `dst_bias = 0 / boundary_off_`。
+
+**核对过、不需要额外守卫的**：`pinned()` / `device_alias()` / `pcie_layer()` 对尾部层天然返回
+`false` / `nullptr`（第二块 `max_pinned_bytes=0` ⇒ `registered_bytes=0`，而 `pinned()` 走
+`blob_offset + bytes <= pinned_bytes_` 判据）。
+
+**回滚**：`engine\strata.exe` 已还原为验证过的旧版；新构建只在 `build-cuda12\`（`build_arena_check.cmd` 只编不装），
+旧引擎备份在 `D:\strata-blackbox\engine-arena-skip\`。
+
 > **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
 > **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
 
