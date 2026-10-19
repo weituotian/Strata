@@ -177,9 +177,78 @@ if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip))
 
 ### 4.6 工作量与风险
 
+> ✅ **2026-10-19 复核后的结论：比原先估的小得多 —— 代码里已经有两个现成钩子。见 §4.7。**
+
 - **估计 150–400 行**，集中在启动构建 / 池读取路径 / ring 记账三处；
 - **风险点**：arena 是平坦内存 + 按偏移访问，**漏拷一个仍会被读到的 blob = 静默读垃圾数据**（不是崩溃）⇒ 必须加一条启动自检：*"每个被排除的 pair 都必须在某张卡的缓存里"*，否则拒绝启动；
 - **测试**：`--dump-routing` 跑真实 agent 负载，统计"被排除 pair 的实际读取次数"，应为 **0**（这是验收的硬判据）。
+
+### 4.7 ✅ 复核后的实施方案（2026-10-19，行号级）
+
+代码里**已经有两个钩子**，所以这不是"从零实现"，而是"补上 Windows 分支 + 收窄触发条件"。
+
+**钩子 1：释放循环已经存在且已经挑对了 pair**
+
+`src/program/generate.cpp:6478-6498`（`STRATA_ARENA_RELEASE=0` 可关闭）：
+
+```cpp
+if (!keep)
+    for (size_t i = 0; i < host_res.size(); ++i)
+        if (host_res[i] != strata::core::kNotResident)          // ← 正是"某张卡缓存里已有"的 pair
+            released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+```
+
+`host_res` 是**唯一权威**的"谁在卡上"表（`generate.cpp:6457-6465`，由 `slot_of()` 逐 pair 填）。
+在 3090+V100 上，它标出 **19374 个** resident pair（V100 的 10752 全满 + 3090 的 8622）。
+
+**钩子 2：`STRATA_NO_LARGEPAGES=1` 已存在**（`src/core/pinned.cu:121-122`）
+—— 让 arena 用 **4 KiB 页**而不是 2 MiB 大页。**这是 Windows 能真正归还内存的前提**：
+`VirtualFree(MEM_DECOMMIT)` 对 4 KiB 页按范围有效，对 `MEM_LARGE_PAGES` 的分配**无效**（只能整块释放）。
+
+**⛔ 为什么不能照搬 Linux 的做法**
+
+`src/core/expert_source.cpp:4837-4850`：
+
+```cpp
+uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert; return 0;          // ← Windows 就是这两行
+#else
+    if (map_ == nullptr ...) return 0;
+    ... madvise(MADV_DONTNEED) ...                  // ← 只在"文件映射的 arena"(STRATA_ARENA_MMAP) 下生效
+#endif
+}
+```
+
+Linux 那边安全的**根本原因**：arena 是**文件映射**，`MADV_DONTNEED` 丢掉的是页缓存里的**副本**，下次读会**从文件重新缺页读回**（注释原话：*"a minor fault away when the CPU needs the expert again (an adaptive swap evicts it)"*）。
+
+**Windows 的 arena 是匿名内存** —— 一旦 decommit，内容**变成零**，读回来就是**静默错误数据**。
+而 `--adapt-every` **默认开着**，它会换出专家；被换出的 pair 下一次就要从 arena 读。⇒ **全量释放是错的。**
+
+**✅ 安全规则：只释放"该层被某张卡 512/512 全覆盖"的 pair**
+
+- 全覆盖的层**没有空槽**可 admit 新专家 ⇒ 自适应层**永远不会换出**它 ⇒ 这些 pair **可证明永不被读**
+- 本机正好是 **V100 的 21 层**（10752/10752），3090 的 27 层是 314/512 ⇒ **不释放**
+- 收益：**21 × 512 × ~2.07 MiB ≈ 21.7 GiB**（commit 同步释放）
+
+**改动清单（4 个文件，约 100–130 行）**
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `include/strata/core/pinned.hpp` | `PinnedArena` 加 `uint64_t release_range(uint64_t off, uint64_t len)` + `bool range_releasable(...) const`（仅 `backing == NormalPages` 且该范围**不在** `pin_ranges` 注册区内 —— 已注册给驱动的页不能 decommit） |
+| 2 | `src/core/pinned.cu` | 实现：`strata::platform::unlock_resident()` 解锁该段 → `VirtualFree(base+off, len, MEM_DECOMMIT)`；POSIX 走 `madvise(MADV_DONTNEED)`。按 **64 KiB 分配粒度**对齐并吃掉首尾重叠 |
+| 3 | `src/core/expert_source.cpp` | `ArenaExpertSource::release()` 补 Windows 分支（算 blob 偏移 → 对齐 → `release_range`）；新增 `std::vector<uint8_t> released_`（`n_layers*n_expert`），并让 `blob()` 对已释放的 pair **返回 nullptr**（池子已有 `d.failed = "the expert source could not produce a blob"` 的响亮失败路径，`expert_source.cpp:3601-3604`）⇒ **把"静默读零"变成"立刻报错"** |
+| 4 | `src/program/generate.cpp:6478-6498` | 释放循环加条件：只对**全覆盖层**调用；新增开关 `STRATA_ARENA_RELEASE_WIN=1`（默认关，避免动到别人）；日志打印释放 GiB 与被判定的层数 |
+
+**必须先设的环境变量**：`STRATA_NO_LARGEPAGES=1`（否则 decommit 无效，`range_releasable` 会返回 false 并在日志里说明）
+
+**验收**（三道，缺一不可）
+
+1. 启动日志出现 `expert arena: N.NN GiB of VRAM-held experts handed back to the OS`，且 **N ≈ 21.7**
+2. `Win32_OperatingSystem.FreeVirtualMemory`（KB 单位）在起服务后**比改前多约 21.7 GiB**；`experts loaded` 仍是 46.84 GiB（拷贝照旧，只是拷完就还）
+3. **真实流量回放**（`replay.py --suite 56:6,0:4`）与 `replay-base-cur.jsonl` 逐条配对：**decode 与三段占比都不变**（±2%）；若出现 `the expert source could not produce a blob` ⇒ 覆盖判定有 bug，**立刻回退**
+
+**风险**：`host_res` 在自适应层换出后由 `res_put()` 更新，而 `released_` 是静态的 —— 所以第 4 步的"只释放全覆盖层"是**正确性的前提**，不是优化。**任何放宽都会导致静默错误。**
 
 ---
 
