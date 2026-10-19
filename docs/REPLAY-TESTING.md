@@ -61,8 +61,11 @@ replay_arm.cmd <config.json> <arm-name>
 
 它做：**停服务（powershell -File）→ taskkill 兜底 → 起配置 → 轮询等 `loaded=true` → 打印引擎 pid/启动时间 → 跑 replay.py**。
 
-> ⚠ **踩过的坑**：`.ps1` 必须用 `powershell -File` 调用。写成 `call stop_strata.ps1` 会**静默失败**，
+> ⚠ **坑 1**：`.ps1` 必须用 `powershell -File` 调用。写成 `call stop_strata.ps1` 会**静默失败**，
 > 于是整档测的是**上一个引擎**（2026-10-19 发生过一次）。工装里现在加了 `taskkill` 兜底和引擎 pid 打印，跑之前先看那行 pid 是不是新的。
+>
+> ⚠ **坑 2**：`suite` 参数含逗号，**必须加引号**：`replay_arm.cmd cfg arm "56:6,0:4"`。
+> cmd 把 `,` 当参数分隔符，不加引号只会收到 `56:6`（第一块），**静默少跑一块**。
 
 ## 4. 精简子集（控制时间）
 
@@ -86,6 +89,22 @@ replay_arm.cmd <config.json> <arm-name>
 block0@56 (#56–61, 200K 尾段)   冷读 ~95 s + 5 条增量 ≈ 170 s
 block1@0  (#0–3, 冷启动)        冷读 ~62 s + 3 条增量 ≈  76 s
 ```
+
+**实测（2026-10-19，base 配置）**：
+
+```
+=== 10 ok, wall 265s ===                                   ← 全量是 708 s，快 2.7 倍
+  [block0@56] n=6  decode=106.2  first=2.66s  VRAM=95.95%  PCIe=0.25%  CPU=3.85%  wall=194s
+  [block1@0]  n=4  decode=115.4  first=2.03s  VRAM=97.45%  PCIe=0.15%  CPU=2.40%  wall= 71s
+  [ALL]       n=10 decode=106.2  first=2.39s  VRAM=96.65%  PCIe=0.20%  CPU=3.10%  wall=265s
+```
+
+⚠ **精简集的绝对值和全量不可互换**：尾段块权重更大，`decode` 比全量的 108.8 低 **2.4%**。
+**A/B 必须用同一套 suite 比**（基线就叫 `base-cur`，全量那次叫 `base`，别混）。
+
+> 块怎么选的：**按上下文规模取两端** —— `#0–3` 是冷启动 + 13.5 万上下文（前缀未命中，走完整 prefill），
+> `#56–61` 是 20.4 万上下文的尾段（真实工作点，几乎全命中前缀）。中间段（15–19 万）行为是这两端的插值，省掉。
+> 代价是每块要付一次冷读（135K ≈ 62 s、204K ≈ 133 s），这是跳块的固定成本，**对各档相同，不产生偏差**。
 
 再快的办法（未采用，会破坏保真度）：截断 `max_tokens`、或只跑单块。
 
