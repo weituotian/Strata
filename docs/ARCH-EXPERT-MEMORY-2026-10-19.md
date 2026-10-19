@@ -382,6 +382,21 @@ strata generate: PLE direct read probe: 195196 rows/s (fine)
 **建议保持 `direct`**：探针健康、零内存代价，且真实请求 99.9% 前缀复用（每条只新读几百 token）。
 要试只试 `mmap` 一档，判据 = `#56` 的 first token + 进程读字节增量。
 
+**2026-10-19 23:0x 实测 `mmap`（已采纳，用户接受 #1984 风险）**：同一套 10 条、都开 release，只差 `--ple-io`：
+
+| 指标 | `direct` | `mmap` |
+|---|---:|---:|
+| 首 token 中位 / `#56`(204K) | 3.03 s / 3.34 s | **3.06 s / 3.38 s** |
+| decode 中位 | 106.5 | 107.8（+1.2% = 噪声） |
+| 墙钟 | 262 s | 263 s |
+| `file_blobs` / `file_mb` | 0 / 0 | 0 / 0 |
+
+⇒ **prefill 没有变快**（单次回放里每条 prompt 只读一遍，页缓存无重复命中可利用），
+decode 也不受影响（PLE 只在 prefill 用）。模式确实切换了：mmap 档日志里**没有** `PLE direct read probe` 行。
+**已写入规范配置 `strata-iq3_s-2gpu.json`**（`--ple-io mmap`，44 参数、无重复），
+理由是用户接受 Windows mapped-file 的风险、换取后续观察空间；**内存上安全**（文件映射不计 commit）。
+⚠ 该档的"是否减少 SSD 读"**没有测准**：I/O 采样取的是旧进程 pid（`replay_arm` 中途重启引擎），要严谨须在 `replay.py` 内嵌 I/O 采样。
+
 > **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
 > **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
 
