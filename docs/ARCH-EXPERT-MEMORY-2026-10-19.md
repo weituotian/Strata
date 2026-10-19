@@ -340,6 +340,48 @@ strata generate: arena-skip: layers 27-47 are fully resident: 21.71 GiB of the e
 本次启动刚用 unbuffered 读了 50 GB，文件缓存是冷的；decode 不变说明解码路径没受影响。
 要用热缓存复核，把同一 suite 再跑一次即可（4.4 分钟）。
 
+### 4.10 ✅ 零专家读盘的两档验收（2026-10-19 23:0x）
+
+同一套 10 条回放，只差 `STRATA_ARENA_RELEASE_BLOCK`：
+
+| 指标 | release **开** | release **关** |
+|---|---:|---:|
+| **`file_blobs` / `file_mb`（每条）** | **0 / 0**（10 条全零） | **0 / 0**（10 条全零） |
+| `ram_blobs` | 0 | 0 |
+| 进程 `ReadTransferCount` 增量 | 6,201 MB | 6,170 MB（**差 0.5%**） |
+| VRAM / PCIe / CPU 中位 | 96.70 / 0.20 / 3.10 % | 96.15 / 0.25 / 3.55 % |
+| decode 中位 | 106.5 | 110.2 |
+| `could not produce a blob` | **0** | **0** |
+| 起服务后 commit 余量 | **21.4 GiB** | **0.5 GiB** |
+
+**结论**：专家 **从不回盘**（`file_blobs` 全零），两档一致 ⇒ 释放不引入读盘。
+release 关的那一档 commit 只剩 **0.5 GiB**，这本身就是开它的理由。
+（decode 106.5 vs 110.2 是**跑的顺序**：开的那档紧接启动、文件缓存被 50 GB unbuffered 装载冲掉；块内方向也不一致，机制上释放的块从不被访问。）
+
+### 4.11 ⚠ prefill 期间的 SSD 读来自 **PLE（n-gram）表**，不是专家
+
+实测：`file_blobs = 0`，但进程 **仍**在 prefill 期间规律读盘（几十~上百 MB/次）。来源是 PLE 表：
+
+```
+strata generate: PLE on, table 320001536 rows of ...IQ3_S-00002-of-00002.gguf
+strata generate: PLE direct read probe: 195196 rows/s (fine)
+```
+
+`generate.cpp:399` 的默认值就是 `direct`，帮助文本与 `docs/DETAILS.md` 都写明：
+
+> `--ple-io direct` (default): **unbuffered** n-gram table reads, **a few rows per token**, past the OS cache
+
+⇒ 每个 prefill token 查几行 28.8 GB 的表，**绕过 OS 缓存**，所以**每次 prefill 都重新读** —— 与"不定时几十到上百 MB"完全对上。
+
+| 取值 | 内存 | 备注 |
+|---|---|---|
+| **`direct`（默认，推荐保留）** | **0** | 引擎探针实测 **195K rows/s**（告警线 15K 的 13 倍）；16 个 in-flight 读与计算重叠 |
+| `mmap` | **不计 commit**（文件映射，干净页可回收），但会吃页缓存 | 不占 28.8 GB 私有内存；**Windows 上有 #1984 的 mapped-file 卡死 prompt 报告** |
+| `ram` | **~28.8 GB 私有**（计 commit） | 本机 release 后只剩 21.4 GiB ⇒ **装不下**，会撞 `0xC0000409` |
+
+**建议保持 `direct`**：探针健康、零内存代价，且真实请求 99.9% 前缀复用（每条只新读几百 token）。
+要试只试 `mmap` 一档，判据 = `#56` 的 first token + 进程读字节增量。
+
 > **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
 > **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
 
