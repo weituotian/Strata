@@ -201,9 +201,22 @@ if (!keep)
 `host_res` 是**唯一权威**的"谁在卡上"表（`generate.cpp:6457-6465`，由 `slot_of()` 逐 pair 填）。
 在 3090+V100 上，它标出 **19374 个** resident pair（V100 的 10752 全满 + 3090 的 8622）。
 
-**钩子 2：`STRATA_NO_LARGEPAGES=1` 已存在**（`src/core/pinned.cu:121-122`）
-—— 让 arena 用 **4 KiB 页**而不是 2 MiB 大页。**这是 Windows 能真正归还内存的前提**：
-`VirtualFree(MEM_DECOMMIT)` 对 4 KiB 页按范围有效，对 `MEM_LARGE_PAGES` 的分配**无效**（只能整块释放）。
+**钩子 2（修正）：大页必须保留 —— 靠"切块 + 整块释放"而不是降级到 4 KiB 页**
+
+`STRATA_NO_LARGEPAGES=1`（`pinned.cu:121`）虽然存在，但它是**降级**（丢掉 2 MiB 大页的 TLB 收益），
+**不是**这个功能的正确前提。大页的真实限制是：**不能部分 decommit，但可以整块 `MEM_RELEASE`**。
+
+⇒ V100 的 21 层（27–47）**正好是一个连续的层区间**，所以把 arena 切成两块即可：
+
+```
+block0 = layers [0, K)    3090 的 27 层（314/512，部分覆盖） → 保留，大页
+block1 = layers [K, 48)   V100 的 21 层（512/512 全覆盖）    → 填完后 VirtualFree(MEM_RELEASE) 整块释放
+```
+
+**切分点在建 arena 之前就已经定了**：`stage_of` 定义在 `generate.cpp:4339`，`split_at` 在 4332–4337 校验完毕，
+而 `arena_src.open()` 在 **4995** —— 中间隔着 1600 行。所以按层切块没有时序问题。
+
+顺带收益：block1 不需要读盘 ⇒ 启动从 **46.84 GiB 降到 25.1 GiB**。
 
 **⛔ 为什么不能照搬 Linux 的做法**
 
@@ -231,16 +244,16 @@ Linux 那边安全的**根本原因**：arena 是**文件映射**，`MADV_DONTNE
 - 本机正好是 **V100 的 21 层**（10752/10752），3090 的 27 层是 314/512 ⇒ **不释放**
 - 收益：**21 × 512 × ~2.07 MiB ≈ 21.7 GiB**（commit 同步释放）
 
-**改动清单（4 个文件，约 100–130 行）**
+**改动清单（3 个文件，约 120–180 行；大页不动）**
 
 | # | 文件 | 改动 |
 |---|---|---|
-| 1 | `include/strata/core/pinned.hpp` | `PinnedArena` 加 `uint64_t release_range(uint64_t off, uint64_t len)` + `bool range_releasable(...) const`（仅 `backing == NormalPages` 且该范围**不在** `pin_ranges` 注册区内 —— 已注册给驱动的页不能 decommit） |
-| 2 | `src/core/pinned.cu` | 实现：`strata::platform::unlock_resident()` 解锁该段 → `VirtualFree(base+off, len, MEM_DECOMMIT)`；POSIX 走 `madvise(MADV_DONTNEED)`。按 **64 KiB 分配粒度**对齐并吃掉首尾重叠 |
-| 3 | `src/core/expert_source.cpp` | `ArenaExpertSource::release()` 补 Windows 分支（算 blob 偏移 → 对齐 → `release_range`）；新增 `std::vector<uint8_t> released_`（`n_layers*n_expert`），并让 `blob()` 对已释放的 pair **返回 nullptr**（池子已有 `d.failed = "the expert source could not produce a blob"` 的响亮失败路径，`expert_source.cpp:3601-3604`）⇒ **把"静默读零"变成"立刻报错"** |
-| 4 | `src/program/generate.cpp:6478-6498` | 释放循环加条件：只对**全覆盖层**调用；新增开关 `STRATA_ARENA_RELEASE_WIN=1`（默认关，避免动到别人）；日志打印释放 GiB 与被判定的层数 |
+| 1 | `src/core/expert_source.cpp` + `include/strata/core/expert_source.hpp` | `ArenaExpertSource` 增加**第二块**：`base1_`（第二个 `PinnedArena`，同样大页）+ `boundary_off_ = lay.layer_offset(K)` + `block1_released_`。`blob(layer,e)` 按偏移选块；block1 已释放则**返回 nullptr**（池子在 `expert_source.cpp:3601-3604` 会响亮失败 `"the expert source could not produce a blob"`）⇒ **把"静默读垃圾"变成"立刻报错"**。`open()` 多接一个 `split_layer` 参数 |
+| 2 | 同上文件的填充循环（`open()` 内，8 MiB 读块处） | 读块要在 `boundary_off_` 处**夹断**（一块可能跨层边界），前半写 block0、后半写 block1；block1 若将被释放，**可以不读**（省 21.7 GiB 启动读盘） |
+| 3 | `src/program/generate.cpp:4995` / `6478-6498` | ① `arena_src.open(...)` 传入切分点（`split_at` 的首元素）；② 释放逻辑从"逐 pair"改成"**按块判定**"：某 stage 的每一层都 `slots_per_layer ≥ 512`（全覆盖）⇒ `VirtualFree(MEM_RELEASE)` 整块；否则保留。开关 `STRATA_ARENA_RELEASE_BLOCK=1`（默认关）；日志打印释放 GiB 与层数 |
 
-**必须先设的环境变量**：`STRATA_NO_LARGEPAGES=1`（否则 decommit 无效，`range_releasable` 会返回 false 并在日志里说明）
+> **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
+> **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
 
 **验收**（三道，缺一不可）
 
