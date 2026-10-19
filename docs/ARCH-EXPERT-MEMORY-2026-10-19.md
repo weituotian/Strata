@@ -244,13 +244,36 @@ Linux 那边安全的**根本原因**：arena 是**文件映射**，`MADV_DONTNE
 - 本机正好是 **V100 的 21 层**（10752/10752），3090 的 27 层是 314/512 ⇒ **不释放**
 - 收益：**21 × 512 × ~2.07 MiB ≈ 21.7 GiB**（commit 同步释放）
 
-**改动清单（3 个文件，约 120–180 行；大页不动）**
+**⚠ 两个复核出来的硬约束（2026-10-19 第二轮，改写了实现细节）**
+
+**① 不能用"估算后提前跳过"** —— V100 的显存余量只有 **~0.26 GiB**：
+需求 21 层 × 512 × 2.07 MiB = **21.70 GiB**；可用 ≈ 26.86（权重后空闲）− 2.9（prompt 4096 缓冲）− 0.7（KV 驻留）− 1.3（预留）= **21.96 GiB**。
+⇒ 估错 1% 就会漏掉"其实会 miss"的层。**所以必须"先分配+装载，拿到 `host_res`（真实槽位表）之后再整块释放"**，
+这也正是 `generate.cpp:6457-6465` 之后才有 `host_res` 的原因。
+
+**② loader 写目标用的是"绝对文件偏移"** —— `src/core/pinned.cu:884`：
+
+```cpp
+const uint64_t off = layer_off[(size_t) L];      // 同时用于 fseek(862) 和 memcpy(884)
+...
+std::memcpy(dst + off + pos, buf.data(), (size_t) n);
+```
+
+⇒ 第二块的 `dst` 不能简单给 `base1`（那样会写到 `base1 + 25 GiB` 之外），**必须给 loader 加一个 `dst_bias`**
+（`dst + off - dst_bias`）。而这会动到 `pinned.hpp` 的两个重载 **以及 `pinned.dp.cpp`（SYCL 后端自己定义了一版）** ——
+头文件注释明确写着 *"an overload, not a default argument: the SYCL build has its own pinned.dp.cpp that defines the signature above only"*。
+
+**改动清单（5 个文件，约 150–200 行；大页不动）**
 
 | # | 文件 | 改动 |
 |---|---|---|
-| 1 | `src/core/expert_source.cpp` + `include/strata/core/expert_source.hpp` | `ArenaExpertSource` 增加**第二块**：`base1_`（第二个 `PinnedArena`，同样大页）+ `boundary_off_ = lay.layer_offset(K)` + `block1_released_`。`blob(layer,e)` 按偏移选块；block1 已释放则**返回 nullptr**（池子在 `expert_source.cpp:3601-3604` 会响亮失败 `"the expert source could not produce a blob"`）⇒ **把"静默读垃圾"变成"立刻报错"**。`open()` 多接一个 `split_layer` 参数 |
-| 2 | 同上文件的填充循环（`open()` 内，8 MiB 读块处） | 读块要在 `boundary_off_` 处**夹断**（一块可能跨层边界），前半写 block0、后半写 block1；block1 若将被释放，**可以不读**（省 21.7 GiB 启动读盘） |
-| 3 | `src/program/generate.cpp:4995` / `6478-6498` | ① `arena_src.open(...)` 传入切分点（`split_at` 的首元素）；② 释放逻辑从"逐 pair"改成"**按块判定**"：某 stage 的每一层都 `slots_per_layer ≥ 512`（全覆盖）⇒ `VirtualFree(MEM_RELEASE)` 整块；否则保留。开关 `STRATA_ARENA_RELEASE_BLOCK=1`（默认关）；日志打印释放 GiB 与层数 |
+| 1 | `include/strata/core/pinned.hpp` | `load_experts_ranges` / `load_experts_direct` 各加 `uint64_t dst_bias = 0`（3 处重载声明） |
+| 2 | `src/core/pinned.cu` | 转发生效 + `memcpy(dst + off - dst_bias, ...)`（两个 loader） |
+| 3 | `src/core/pinned.dp.cpp` | SYCL 后端的同名定义同步加参数（否则 SYCL 构建断） |
+| 4 | `src/core/expert_source.cpp` + `include/strata/core/expert_source.hpp` | `ArenaExpertSource` 加第二块：`arena1_`（第二个 `PinnedArena`，同样大页）、`base1_`、`boundary_off_ = lay.layer_offset(K)`。`open()` 接 `split_layer`：块0 装 [0,K)，块1 装 [K,48)（`dst_bias = boundary_off_`）。`blob_at()` 按层选块；**块1 释放后返回 nullptr** ⇒ 池子响亮失败。新增 `release_tail()`（`delete` 掉 `arena1_`，整块 `MEM_RELEASE`），返回释放字节数 |
+| 5 | `src/program/generate.cpp:4995` / `6478-6498` | ① `open(..., split_at[0])`；② **拿到 `host_res` 之后**判定：末段 stage 的每一层 `resident == n_expert`（512/512）⇒ 调 `release_tail()`；否则不释放。开关 `STRATA_ARENA_RELEASE_BLOCK=1`（默认关）；日志打印释放 GiB 与层数 |
+
+**分三次提交，每次都能单独编译**：① pinned（3 文件）→ ② expert_source 双块 → ③ generate.cpp 判定与释放。
 
 > **为什么按块而不是按 pair**：大页不能部分 decommit，但能整块 `MEM_RELEASE`；而 V100 的 21 层正好是连续区间。
 > **为什么只对全覆盖的 stage 释放**：全满的层没有空槽可 `admit` 新专家 ⇒ 自适应层**永不换出** ⇒ 那 21.7 GiB **可证明永不被读**（3090 是 314/512，不满足，保留）。
